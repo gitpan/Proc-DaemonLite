@@ -1,9 +1,9 @@
 ############################################################
 #
-#   $Id: DaemonLite.pm 537 2006-05-29 19:04:33Z nicolaw $
+#   $Id: DaemonLite.pm 946 2007-02-11 15:14:13Z nicolaw $
 #   Proc::DaemonLite - Simple server daemonisation module
 #
-#   Copyright 2006 Nicola Worthington
+#   Copyright 2006,2007 Nicola Worthington
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ use strict;
 use Exporter;
 use Carp qw(croak cluck carp);
 use POSIX qw(:signal_h setsid WNOHANG);
-#use Carp::Heavy; # Is this really needed?
 use File::Basename qw(basename);
 use IO::File;
 use Cwd qw(getcwd);
@@ -35,14 +34,17 @@ use Sys::Syslog qw(:DEFAULT setlogsock);
 use constant PIDPATH  => -d '/var/run' && -w _ ? '/var/run' : '/var/tmp';
 use constant FACILITY => 'local0';
 
-use vars qw($VERSION $DEBUG @EXPORT @EXPORT_OK %EXPORT_TAGS @ISA %CHILDREN);
+use vars qw($VERSION @EXPORT @EXPORT_OK %EXPORT_TAGS @ISA
+			$DEBUG %CHILDREN $SCRIPT);
 
-$VERSION = '0.00_1' || sprintf('%d', q$Revision: 537 $ =~ /(\d+)/g);
+BEGIN { use vars qw($SCRIPT); $SCRIPT = $0; }
+
+$VERSION = '0.01' || sprintf('%d', q$Revision: 946 $ =~ /(\d+)/g);
 $DEBUG = $ENV{DEBUG} ? 1 : 0;
 
 @ISA = qw(Exporter);
-@EXPORT_OK = qw(&init_server &kill_children &launch_child
-	&do_relaunch &log_debug &log_notice &log_warn &log_die &log_info %CHILDREN);
+@EXPORT_OK = qw(&init_server &kill_children &launch_child &do_relaunch
+		&log_debug &log_notice &log_warn &log_die &log_info %CHILDREN);
 @EXPORT = qw(&init_server);
 %EXPORT_TAGS = (all => \@EXPORT_OK);
 
@@ -50,6 +52,7 @@ $DEBUG = $ENV{DEBUG} ? 1 : 0;
 my ($pid, $pidfile, $saved_dir, $CWD);
 
 sub init_server {
+	TRACE('init_server()');
 	my ($user, $group);
 	($pidfile, $user, $group) = @_;
 	$pidfile ||= _getpidfilename();
@@ -63,6 +66,7 @@ sub init_server {
 }
 
 sub _become_daemon {
+	TRACE('_become_daemon()');
 	croak "Can't fork" unless defined(my $child = fork);
 	exit(0) if $child;   # parent dies;
 	POSIX::setsid();     # become session leader
@@ -70,7 +74,7 @@ sub _become_daemon {
 	open(STDOUT, ">/dev/null");
 	open(STDERR, ">&STDOUT");
 	$CWD = Cwd::getcwd;  # remember working directory
-	chdir '/';           # change working directory
+	chdir('/');          # change working directory
 	umask(0);            # forget file mode creation mask
 	$ENV{PATH} = '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin';
 	delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
@@ -78,6 +82,7 @@ sub _become_daemon {
 }
 
 sub _change_privileges {
+	TRACE('_change_privileges()');
 	my ($user, $group) = @_;
 	my $uid = getpwnam($user)  or die "Can't get uid for $user\n";
 	my $gid = getgrnam($group) or die "Can't get gid for $group\n";
@@ -87,11 +92,14 @@ sub _change_privileges {
 }
 
 sub launch_child {
+	TRACE('launch_child()');
 	my $callback = shift;
 	my $home     = shift;
+
 	my $signals  = POSIX::SigSet->new(SIGINT, SIGCHLD, SIGTERM, SIGHUP);
 	sigprocmask(SIG_BLOCK, $signals);    # block inconvenient signals
 	log_die("Can't fork: $!") unless defined(my $child = fork());
+
 	if ($child) {
 		$CHILDREN{$child} = $callback || 1;
 	} else {
@@ -99,10 +107,12 @@ sub launch_child {
 		_prepare_child($home);
 	}
 	sigprocmask(SIG_UNBLOCK, $signals);    # unblock signals
+
 	return $child;
 }
 
 sub _prepare_child {
+	TRACE('_prepare_child()');
 	my $home = shift;
 	if ($home) {
 		local ($>, $<) = ($<, $>);         # become root again (briefly)
@@ -113,6 +123,7 @@ sub _prepare_child {
 }
 
 sub _reap_child {
+	TRACE('_reap_child()');
 	while ((my $child = waitpid(-1, WNOHANG)) > 0) {
 		$CHILDREN{$child}->($child) if ref $CHILDREN{$child} eq 'CODE';
 		delete $CHILDREN{$child};
@@ -120,6 +131,8 @@ sub _reap_child {
 }
 
 sub kill_children {
+	TRACE('kill_children()');
+	DUMP('%CHILDREN',\%CHILDREN);
 	kill TERM => keys %CHILDREN;
 
 	# wait until all the children die
@@ -127,34 +140,43 @@ sub kill_children {
 }
 
 sub do_relaunch {
+	TRACE('do_relaunch()');
 	$> = $<;    # regain privileges
 	chdir $1 if $CWD =~ m!([./a-zA-z0-9_-]+)!;
-	croak "bad program name" unless $0 =~ m!([./a-zA-z0-9_-]+)!;
+	croak "bad program name" unless $SCRIPT =~ m!([./a-zA-z0-9_-]+)!;
 	my $program = $1;
-	my $port = $1 if $ARGV[0] =~ /(\d+)/;
 	unlink($pidfile);
-	exec('perl', '-T', $program, $port) or croak "Couldn't exec: $!";
+
+	my @perl = ($^X);
+	push @perl, '-T' if ${^TAINT} eq 1;
+	push @perl, '-t' if ${^TAINT} eq -1;
+	push @perl, '-w' if $^W;
+
+	exec(@perl, $program, @ARGV) or croak "Couldn't exec: $!";
 }
 
 sub _init_log {
+	TRACE('_init_log()');
 	Sys::Syslog::setlogsock('unix');
-	my $basename = File::Basename::basename($0);
+	my $basename = File::Basename::basename($SCRIPT);
 	openlog($basename, 'pid', FACILITY);
 	$SIG{__WARN__} = \&log_warn;
 	$SIG{__DIE__}  = \&log_die;
 }
 
-sub log_debug  { syslog('debug',   _msg(@_)) }
-sub log_notice { syslog('notice',  _msg(@_)) }
-sub log_warn   { syslog('warning', _msg(@_)) }
-sub log_info   { syslog('info',    _msg(@_)) }
+sub log_debug  { TRACE('log_debug()');  syslog('debug',   _msg(@_)) }
+sub log_notice { TRACE('log_notice()'); syslog('notice',  _msg(@_)) }
+sub log_warn   { TRACE('log_warn()');   syslog('warning', _msg(@_)) }
+sub log_info   { TRACE('log_info()');   syslog('info',    _msg(@_)) }
 
 sub log_die {
+	TRACE('log_die()');
 	Sys::Syslog::syslog('crit', _msg(@_)) unless $^S;
 	die @_;
 }
 
 sub _msg {
+	TRACE('_msg()');
 	my $msg = join('', @_) || "Something's wrong";
 	my ($pack, $filename, $line) = caller(1);
 	$msg .= " at $filename line $line\n" unless $msg =~ /\n$/;
@@ -162,12 +184,15 @@ sub _msg {
 }
 
 sub _getpidfilename {
-	my $basename = File::Basename::basename($0, '.pl');
+	TRACE('_getpidfilename()');
+	my $basename = File::Basename::basename($SCRIPT, '.pl');
 	return PIDPATH . "/$basename.pid";
 }
 
 sub _open_pid_file {
+	TRACE('_open_pid_file()');
 	my $file = shift;
+
 	if (-e $file) {    # oops.  pid file already exists
 		my $fh = IO::File->new($file) || return;
 		my $pid = <$fh>;
@@ -176,6 +201,7 @@ sub _open_pid_file {
 		cluck "Removing PID file for defunct server process $pid.\n";
 		croak "Can't unlink PID file $file" unless -w $file && unlink $file;
 	}
+
 	return IO::File->new($file, O_WRONLY | O_CREAT | O_EXCL, 0644)
 		or die "Can't create $file: $!\n";
 }
@@ -187,6 +213,7 @@ END {
 
 sub TRACE {
 	return unless $DEBUG;
+	log_debug($_[0]);
 	warn(shift());
 }
 
@@ -194,7 +221,9 @@ sub DUMP {
 	return unless $DEBUG;
 	eval {
 		require Data::Dumper;
-		warn(shift().': '.Data::Dumper::Dumper(shift()));
+		my $msg = shift().': '.Data::Dumper::Dumper(shift());
+		log_debug($msg);
+		warn($msg);
 	}
 }
 
@@ -301,13 +330,18 @@ L<perlfork>
 
 =head1 VERSION
 
-$Id: DaemonLite.pm 537 2006-05-29 19:04:33Z nicolaw $
+$Id: DaemonLite.pm 946 2007-02-11 15:14:13Z nicolaw $
 
 =head1 AUTHOR
 
 Nicola Worthington <nicolaw@cpan.org>
 
 L<http://perlgirl.org.uk>
+
+If you like this software, why not show your appreciation by sending the
+author something nice from her
+L<Amazon wishlist|http://www.amazon.co.uk/gp/registry/1VZXC59ESWYK0?sort=priority>? 
+( http://www.amazon.co.uk/gp/registry/1VZXC59ESWYK0?sort=priority )
 
 Original code written by Lincoln D. Stein, featured in "Network Programming
 with Perl". L<http://www.modperl.com/perl_networking/>
@@ -316,7 +350,7 @@ Released with permission of Lincoln D. Stein.
 
 =head1 COPYRIGHT
 
-Copyright 2006 Nicola Worthington.
+Copyright 2006,2007 Nicola Worthington.
 
 This software is licensed under The Apache Software License, Version 2.0.
 
